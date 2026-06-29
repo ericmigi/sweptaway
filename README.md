@@ -73,5 +73,8 @@ Requires Pillow (`pip install pillow`).
 
 ## Credit
 
-Concept after Maarten Baas, *Sweepers Clock* / *Real Time*
-(<https://maartenbaas.com>). This is a fan homage built for PebbleOS.
+Concept after Maarten Baas, *Sweepers Clock* / *Real Time*. This is a fan
+homage built for PebbleOS.
+
+- Original film: [Real Time — Sweepers Clock (YouTube)](https://www.youtube.com/watch?v=0eBVFLlKO80)
+- Artist's page: [maartenbaas.com — Real Time, Sweepers Clock](https://maartenbaas.com/products/real-time-sweepers-clock)
