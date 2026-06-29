@@ -1,5 +1,13 @@
 # Swept Away — a Sweeper's Clock watchface for PebbleOS
 
+<p align="center">
+  <img src="sweptaway-1010.gif" width="260" alt="Swept Away watchface showing 10:10, two sweepers brooming the hands">
+</p>
+
+> ⚠️ **Battery warning:** this face animates at **30 fps constantly** — the two
+> sweepers never stop working — so it will **absolutely destroy battery life**.
+> It's a demo / art piece, not an everyday face. You've been warned.
+
 A Pebble watchface inspired by Dutch artist **Maarten Baas**' *Sweepers Clock*
 (from his *Real Time* series), in which two street sweepers spend twelve hours
 pushing piles of rubbish into the shape of an analog clock's hands.
