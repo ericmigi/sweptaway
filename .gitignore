@@ -1,0 +1,12 @@
+# Pebble build output
+build/
+*.pbw
+
+# tooling / editor
+.cursor/
+node_modules/
+
+# scratch
+*.png
+*.jpg
+*.ppm
