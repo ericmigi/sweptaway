@@ -36,12 +36,28 @@ static int s_hour_len;  // hour hand length
 // step back, repeat — slowly drifting along the hand's length.
 #define STROKE 64              // frames per stroke (push + lift-and-step-back)
 #define STROKE_PUSH 40         // of which this many are the forward push
-#define STROKE_ARC (TRIG_MAX_ANGLE / 40)  // ~9 deg pushed per stroke
+#define STROKE_ARC (TRIG_MAX_ANGLE / 40)  // ~9 deg minimum push per stroke
 #define RAD_PERIOD 1500        // frames to drift once along the hand (~50s)
+// The broom plants far enough behind to reach the worst straggler, so a grain
+// can never fall permanently out of reach. Capped so recovery sweeps stay sane.
+#define ARC_MARGIN (TRIG_MAX_ANGLE / 120)  // ~3 deg behind the worst laggard
+#define MAX_ARC (TRIG_MAX_ANGLE / 6)       // ~60 deg cap on reach-back
+
+// How far (perpendicular) the worker's body stands off the pile line — a fixed
+// offset so the (now larger) figure never sits on the pile, while only the
+// broom does the slow sweeping.
+#define STANDOFF 22
+
+// Pauses: a worker doesn't sweep every stroke. It rests a fraction of stroke
+// slots (standing back, observing), and rests more when little needs pushing.
+// The two use different rest patterns, so often only one works at a time.
+#define REST_BASE 64    // % of slots spent resting when the hand is caught up
+#define REST_SPAN 52    // rest less as more grains lag behind
+#define LAG_THRESH 320  // a grain this far (angle units) behind target = "work"
 
 // Sweeper B's slow tour: dwell on the minute hand, walk to the hour hand
 // (through the center), dwell, walk back. All frame counts at ~30 fps.
-#define B_MIN_DWELL 2400       // ~80s working the minute hand
+#define B_MIN_DWELL 2400      // ~80s working the minute hand
 #define B_TRAVEL 120           // ~4s walking each way (broom up)
 #define B_HOUR_DWELL 600       // ~20s tending the hour hand
 
@@ -49,6 +65,13 @@ static Window *s_window;
 static Layer *s_layer;
 static AppTimer *s_timer;
 static uint32_t s_frame;
+
+static int isqrt(int v) {
+  if (v <= 0) return 0;
+  int x = v, y = (x + 1) / 2;
+  while (y < x) { x = y; y = (x + v / x) / 2; }
+  return x;
+}
 
 // --- hashing & a tiny PRNG (PRNG only used for the static floor texture) -----
 static uint32_t hash2(uint32_t a, uint32_t b) {
@@ -154,20 +177,26 @@ static void draw_grains(GContext *ctx, const Grain *g, int n) {
 
 // The state of one human sweep stroke at the current frame.
 typedef struct {
-  GPoint broom;   // where the broom head is
+  GPoint broom;   // where the broom head reaches (on the pile, when down)
+  GPoint body;    // where the worker stands (stepped off the line)
   int32_t face;   // angle the worker is pushing toward (clockwise tangential)
   bool down;      // true while pushing forward (the only time grains move)
+  bool active;    // false while resting (standing back, observing)
 } Stroke;
 
-// A sweeper plants the broom STROKE_ARC behind the target and pushes forward to
-// it, then lifts and steps back. It also drifts slowly along the hand's length.
+// A sweeper plants the broom `plant_arc` behind the target and pushes forward to
+// it, then lifts and drifts slowly along the hand. `plant_arc` grows to reach
+// the worst straggler so nothing is left behind. When `resting` it just holds
+// the planted pose and watches — no push, so no grains move. The body always
+// stands exactly 90 degrees off the hand, so the broom pushes side-on.
 static Stroke stroke_state(int32_t target, int start, int len, uint32_t frame,
-                           uint32_t phase) {
+                           uint32_t phase, bool resting, int plant_arc) {
   uint32_t p = (frame + phase) % STROKE;
-  bool down = p < STROKE_PUSH;
-  int off = down ? (int)((p * STROKE_ARC) / STROKE_PUSH)
-                 : (int)(((STROKE - p) * STROKE_ARC) / (STROKE - STROKE_PUSH));
-  int32_t ba = target - STROKE_ARC + off;  // sweeps from behind up to target
+  bool down = !resting && p < STROKE_PUSH;
+  int off = resting ? 0
+            : (down ? (int)((p * plant_arc) / STROKE_PUSH)
+                    : (int)(((STROKE - p) * plant_arc) / (STROKE - STROKE_PUSH)));
+  int32_t ba = target - plant_arc + off;  // broom head sweeps the arc up to target
 
   int32_t s = sin_lookup(ba), c = cos_lookup(ba);
   uint32_t rp = (frame + phase) % RAD_PERIOD;
@@ -175,69 +204,83 @@ static Stroke stroke_state(int32_t target, int start, int len, uint32_t frame,
   int upr = ((int)rp < half) ? (int)rp : (RAD_PERIOD - (int)rp);
   int r = start + (upr * (len - start)) / half;
 
+  // The hand's own perpendicular (tangential) direction — the body stands off
+  // along it so the broom handle is exactly 90 degrees to the hand.
+  int32_t ct = cos_lookup(target), stg = sin_lookup(target);
+
   Stroke st;
   st.broom = GPoint(CENTER.x + (int)((s * r) / TRIG_MAX_RATIO),
                     CENTER.y - (int)((c * r) / TRIG_MAX_RATIO));
+  st.body = GPoint(st.broom.x - (int)((ct * STANDOFF) / TRIG_MAX_RATIO),
+                   st.broom.y - (int)((stg * STANDOFF) / TRIG_MAX_RATIO));
   st.face = ba;
   st.down = down;
+  st.active = !resting;
   return st;
 }
 
-// Draw the worker given resolved body & broom-head points. When `down`, the
-// broom reaches the pile; otherwise it is lifted (the worker is walking).
+// Draw a worker (~3x the old size): an upright little figure in blue overalls
+// holding a broom that reaches toward `broom`. When `down` the broom is on the
+// pile; otherwise it is lifted and carried while walking.
 static void draw_sprite(GContext *ctx, GPoint body, GPoint broom, bool down,
-                        uint32_t frame) {
-  int step = (int)((frame >> 3) & 1u);
-  int bx = body.x, by = body.y - step;
+                        bool moving, uint32_t frame) {
+  int swing = moving ? (int)((frame >> 2) & 3u) : 0;  // legs only move when moving
+  int legA = (swing == 1) ? 1 : (swing == 3) ? -1 : 0;
+  int bob = (swing == 1 || swing == 3) ? -1 : 0;
+  int bx = body.x, by = body.y + bob;
 
+  const GColor overalls = GColorFromRGB(0x00, 0x00, 0xAA);
+  const GColor skin = GColorFromRGB(0xFF, 0xAA, 0x55);
+  const GColor wood = GColorFromRGB(0xAA, 0x55, 0x00);
+  const GColor straw = GColorFromRGB(0xFF, 0xFF, 0xAA);
+  const GColor dark = GColorFromRGB(0x00, 0x00, 0x55);
+
+  // --- broom: from the figure's hands toward the pile -----------------------
+  int dx = broom.x - bx, dy = broom.y - by;
+  int len = isqrt(dx * dx + dy * dy);
+  if (len < 1) len = 1;
+  int ux = dx * 256 / len, uy = dy * 256 / len;  // unit toward pile (x256)
+  int grip_x = bx + ux * 7 / 256, grip_y = by + uy * 7 / 256 - 2;
   int hx, hy;
-  if (down) {
+  if (down) {                                  // broom head on the pile
     hx = broom.x;
     hy = broom.y;
-  } else {                          // broom raised while walking
-    hx = bx + (broom.x - bx) / 2;
-    hy = by + (broom.y - by) / 2 - 3;
+  } else {                                     // lifted and carried
+    hx = bx + dx * 55 / 100;
+    hy = by + dy * 55 / 100 - 6;
   }
 
-  int hdx = hx - bx, hdy = hy - by;
-  graphics_context_set_stroke_color(ctx, GColorFromRGB(0xAA, 0x55, 0x00));
-  graphics_context_set_stroke_width(ctx, 1);
-  graphics_draw_line(ctx, GPoint(bx, by), GPoint(hx, hy));
+  // legs (walking)
+  graphics_context_set_stroke_color(ctx, dark);
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_line(ctx, GPoint(bx - 2, by + 7), GPoint(bx - 3 + legA, by + 14));
+  graphics_draw_line(ctx, GPoint(bx + 2, by + 7), GPoint(bx + 3 - legA, by + 14));
 
-  // bristle fan perpendicular to the handle, splayed forward onto the trash
-  // bristle fan as wide as the sweep reach, so the brush covers what it moves
-  int L = (hdx < 0 ? -hdx : hdx) + (hdy < 0 ? -hdy : hdy);
-  if (L < 1) L = 1;
-  graphics_context_set_stroke_color(ctx, GColorFromRGB(0xFF, 0xFF, 0xAA));
-  for (int k = -7; k <= 7; k++) {
-    int fx = hx + (-hdy * k) / L;
-    int fy = hy + (hdx * k) / L;
-    int gx = fx + (hdx * 2) / L;
-    int gy = fy + (hdy * 2) / L;
+  // broom handle
+  graphics_context_set_stroke_color(ctx, wood);
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_line(ctx, GPoint(grip_x, grip_y), GPoint(hx, hy));
+
+  // bristle fan, perpendicular to the broom, splayed onto the trash
+  int px = -uy, py = ux;  // perpendicular unit (x256)
+  graphics_context_set_stroke_color(ctx, straw);
+  graphics_context_set_stroke_width(ctx, 1);
+  for (int k = -9; k <= 9; k += 2) {
+    int fx = hx + px * k / 256, fy = hy + py * k / 256;
+    int gx = fx + ux * 5 / 256, gy = fy + uy * 5 / 256;
     graphics_draw_line(ctx, GPoint(fx, fy), GPoint(gx, gy));
   }
 
-  graphics_context_set_fill_color(ctx, GColorFromRGB(0x00, 0x00, 0xAA));
-  graphics_fill_circle(ctx, GPoint(bx, by), 3);
-  graphics_context_set_fill_color(ctx, GColorFromRGB(0xFF, 0xAA, 0x55));
-  graphics_fill_circle(ctx, GPoint(bx, by - 3), 2);
+  // torso (overalls) + head
+  graphics_context_set_fill_color(ctx, overalls);
+  graphics_fill_rect(ctx, GRect(bx - 4, by - 3, 9, 11), 3, GCornersAll);
+  graphics_context_set_fill_color(ctx, skin);
+  graphics_fill_circle(ctx, GPoint(bx, by - 7), 4);
 
-  graphics_context_set_stroke_color(ctx, GColorFromRGB(0x00, 0x00, 0x55));
-  if (step) {
-    graphics_draw_pixel(ctx, GPoint(bx - 3, by + 1));
-    graphics_draw_pixel(ctx, GPoint(bx + 2, by + 3));
-  } else {
-    graphics_draw_pixel(ctx, GPoint(bx - 2, by + 3));
-    graphics_draw_pixel(ctx, GPoint(bx + 3, by + 1));
-  }
-}
-
-// Resolve a sweeping worker's body point sitting one pace behind the broom in
-// the push direction.
-static GPoint body_behind(GPoint broom, int32_t face) {
-  int32_t s = sin_lookup(face), c = cos_lookup(face);
-  return GPoint(broom.x - (int)((c * 9) / TRIG_MAX_RATIO),
-                broom.y - (int)((s * 9) / TRIG_MAX_RATIO));
+  // arm to the broom grip
+  graphics_context_set_stroke_color(ctx, overalls);
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_line(ctx, GPoint(bx, by - 1), GPoint(grip_x, grip_y));
 }
 
 static void draw_floor(GContext *ctx, GRect bounds) {
@@ -252,6 +295,65 @@ static void draw_floor(GContext *ctx, GRect bounds) {
     int y = rng_range(0, bounds.size.h - 1);
     if (rng_next() & 1) graphics_draw_pixel(ctx, GPoint(x, y));
   }
+}
+
+static GPoint polar(int radius, int32_t angle) {
+  int32_t s = sin_lookup(angle), c = cos_lookup(angle);
+  return GPoint(CENTER.x + (int)((s * radius) / TRIG_MAX_RATIO),
+                CENTER.y - (int)((c * radius) / TRIG_MAX_RATIO));
+}
+
+static GPoint lerp_pt(GPoint a, GPoint b, int t256) {
+  return GPoint(a.x + (b.x - a.x) * t256 / 256, a.y + (b.y - a.y) * t256 / 256);
+}
+
+// Walking from the minute hand to the hour hand WITHOUT crossing either pile:
+// step out past the tips, arc around the rim, then step in. frac 0..256.
+static GPoint travel_point(int frac, GPoint mb, GPoint hb, int32_t mt,
+                           int32_t ht, int router) {
+  GPoint out_m = polar(router, mt), out_h = polar(router, ht);
+  if (frac < 85) return lerp_pt(mb, out_m, frac * 256 / 85);
+  if (frac < 171) {
+    int16_t d = (int16_t)(ht - mt);  // short way around the outside
+    int32_t a = mt + (int32_t)d * (frac - 85) / 86;
+    return polar(router, a);
+  }
+  return lerp_pt(out_h, hb, (frac - 171) * 256 / 85);
+}
+
+// How many grains are still meaningfully behind the target (i.e. need pushing).
+static int count_lag(const Grain *g, int n, uint16_t target) {
+  int lag = 0;
+  for (int i = 0; i < n; i++) {
+    uint16_t fwd = (uint16_t)(target - g[i].angle);
+    if (fwd > LAG_THRESH && fwd < TRIG_MAX_ANGLE / 2) lag++;
+  }
+  return lag;
+}
+
+// More lag -> rest less; caught up -> rest more.
+static int rest_pct(int lag, int total) {
+  int p = REST_BASE - (REST_SPAN * lag) / total;
+  return p < 6 ? 6 : p;
+}
+
+// The largest amount any grain is behind the target (clockwise distance).
+static uint16_t pile_max_lag(const Grain *g, int n, uint16_t target) {
+  uint16_t m = 0;
+  for (int i = 0; i < n; i++) {
+    uint16_t fwd = (uint16_t)(target - g[i].angle);
+    if (fwd < TRIG_MAX_ANGLE / 2 && fwd > m) m = fwd;
+  }
+  return m;
+}
+
+// Plant the broom just behind the worst straggler (>= the normal stroke arc,
+// <= a sane cap), so every grain is always within reach of a sweep.
+static int plant_arc_for(uint16_t max_lag) {
+  int a = (int)max_lag + ARC_MARGIN;
+  if (a < STROKE_ARC) a = STROKE_ARC;
+  if (a > MAX_ARC) a = MAX_ARC;
+  return a;
 }
 
 static void update_proc(Layer *layer, GContext *ctx) {
@@ -275,16 +377,36 @@ static void update_proc(Layer *layer, GContext *ctx) {
     s_inited = true;
   }
 
-  // Sweeper A always works the minute hand.
-  Stroke A = stroke_state(min_target, MIN_START, MIN_LEN, s_frame, 0);
-  GPoint a_body = body_behind(A.broom, A.face);
+  // Rest probability per hand: more when the hand is already mostly formed.
+  int min_rest = rest_pct(count_lag(s_min, MIN_COUNT, min_target), MIN_COUNT);
+  int hour_rest = rest_pct(count_lag(s_hour, HOUR_COUNT, hour_target), HOUR_COUNT);
+
+  // Reach-back per hand: enough to catch the worst straggler so none is lost.
+  int min_plant = plant_arc_for(pile_max_lag(s_min, MIN_COUNT, min_target));
+  int hour_plant = plant_arc_for(pile_max_lag(s_hour, HOUR_COUNT, hour_target));
+
+  // A and B share the minute hand but keep to opposite halves so they never
+  // stand on top of each other: A works the inner half, B the outer half.
+  int min_mid = MIN_LEN / 2;
+
+  // Sweeper A always works the inner minute hand. It rests on some stroke slots.
+  uint32_t slotA = s_frame / STROKE;
+  bool restA = (int)(hash2(0xA1u, slotA) % 100u) < min_rest;
+  Stroke A = stroke_state(min_target, MIN_START, min_mid, s_frame, 0, restA,
+                          min_plant);
+  GPoint a_body = A.body;
 
   // Sweeper B works the minute hand, then tours to the hour hand and back on a
   // slow cycle, walking through the center (where the hands meet) so it never
-  // jumps. w: 0 = on minute, 256 = on hour, in between = walking.
+  // jumps. w: 0 = on minute, 256 = on hour, in between = walking. Its rest
+  // pattern uses a different seed than A, so often only one is working.
   uint32_t Bphase = STROKE / 2 + 211;
-  Stroke Bm = stroke_state(min_target, MIN_START, MIN_LEN, s_frame, Bphase);
-  Stroke Bh = stroke_state(hour_target, HOUR_START, HOUR_LEN, s_frame, Bphase);
+  uint32_t slotB = (s_frame + Bphase) / STROKE;
+  int bhash = (int)(hash2(0xB2u, slotB) % 100u);
+  Stroke Bm = stroke_state(min_target, min_mid, MIN_LEN, s_frame, Bphase,
+                           bhash < min_rest, min_plant);
+  Stroke Bh = stroke_state(hour_target, HOUR_START, HOUR_LEN, s_frame, Bphase,
+                           bhash < hour_rest, hour_plant);
 
   uint32_t total = B_MIN_DWELL + B_TRAVEL + B_HOUR_DWELL + B_TRAVEL;
   uint32_t cyc = s_frame % total;
@@ -300,29 +422,34 @@ static void update_proc(Layer *layer, GContext *ctx) {
   }
 
   GPoint b_broom, b_body;
-  bool b_down, b_on_min = false, b_on_hour = false;
+  bool b_down, b_moving, b_on_min = false, b_on_hour = false;
   if (w <= 0) {
     b_broom = Bm.broom;
-    b_body = body_behind(b_broom, Bm.face);
+    b_body = Bm.body;
     b_down = Bm.down;
+    b_moving = Bm.active;
     b_on_min = true;
   } else if (w >= 256) {
     b_broom = Bh.broom;
-    b_body = body_behind(b_broom, Bh.face);
+    b_body = Bh.body;
     b_down = Bh.down;
+    b_moving = Bh.active;
     b_on_hour = true;
-  } else {  // walking through the center, broom up
-    GPoint from, to;
-    int frac;
-    if (w < 128) { from = Bm.broom; to = CENTER; frac = w * 2; }
-    else { from = CENTER; to = Bh.broom; frac = (w - 128) * 2; }
-    b_broom = GPoint(from.x + (to.x - from.x) * frac / 256,
-                     from.y + (to.y - from.y) * frac / 256);
-    int dx = to.x - from.x, dy = to.y - from.y;
+  } else {  // walking hand-to-hand: out past the tips and around the rim
+    int router = MIN_LEN + 12;
+    bool to_hour = cyc < B_MIN_DWELL + B_TRAVEL;
+    b_body = travel_point(w, Bm.body, Bh.body, min_target, hour_target, router);
+    int wa = w + (to_hour ? 6 : -6);
+    if (wa < 0) wa = 0;
+    if (wa > 256) wa = 256;
+    GPoint ahead =
+        travel_point(wa, Bm.body, Bh.body, min_target, hour_target, router);
+    int dx = ahead.x - b_body.x, dy = ahead.y - b_body.y;
     int L = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
     if (L < 1) L = 1;
-    b_body = GPoint(b_broom.x - dx * 9 / L, b_broom.y - dy * 9 / L);
+    b_broom = GPoint(b_body.x + dx * 14 / L, b_body.y + dy * 14 / L);
     b_down = false;
+    b_moving = true;  // walking
   }
 
   // Only brooms that are pushing (down) actually move grains.
@@ -343,8 +470,8 @@ static void update_proc(Layer *layer, GContext *ctx) {
   draw_grains(ctx, s_hour, HOUR_COUNT);
   draw_grains(ctx, s_min, MIN_COUNT);
 
-  draw_sprite(ctx, b_body, b_broom, b_down, s_frame);
-  draw_sprite(ctx, a_body, A.broom, A.down, s_frame);
+  draw_sprite(ctx, b_body, b_broom, b_down, b_moving, s_frame);
+  draw_sprite(ctx, a_body, A.broom, A.down, A.active, s_frame);
 }
 
 static void anim_timer(void *data) {

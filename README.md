@@ -1,7 +1,11 @@
 # Swept Away — a Sweeper's Clock watchface for PebbleOS
 
 <p align="center">
-  <img src="sweptaway-1010.gif" width="260" alt="Swept Away watchface showing 10:10, two sweepers brooming the hands">
+  <img src="sweptaway-1010.gif" width="240" alt="Swept Away at 10:10 on gabbro (round)">
+  &nbsp;&nbsp;
+  <img src="sweptaway-1010-emery.gif" width="184" alt="Swept Away at 10:10 on emery (rectangular)">
+  <br>
+  <sub>gabbro / Getafix (round) &nbsp;·&nbsp; emery / Obelix (rectangular)</sub>
 </p>
 
 > ⚠️ **Battery warning:** this face animates at **30 fps constantly** — the two
